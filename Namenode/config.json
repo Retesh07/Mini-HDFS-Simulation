@@ -1,0 +1,23 @@
+{
+  "namenode": {
+    "host": "127.0.0.1",
+    "client_port": 5000,
+    "heartbeat_port": 5001
+  },
+  "datanodes": {
+    "dn0": { 
+      "host": "127.0.0.1", 
+      "port": 6001, 
+      "storage_dir": "./storage_dn0" 
+    },
+    "dn1": { 
+      "host": "127.0.0.1", 
+      "port": 6002, 
+      "storage_dir": "./storage_dn1" 
+    }
+  },
+  "replication_factor": 2,
+  "chunk_size_mb": 2,
+  "heartbeat_interval_sec": 3,
+  "heartbeat_timeout_sec": 10
+}
