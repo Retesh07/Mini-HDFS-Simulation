@@ -1,0 +1,40 @@
+# ===== Internal Documentation =====
+project_description.md
+setup_git_history.ps1
+
+# ===== Runtime Data (auto-generated) =====
+Namenode/metadata.json
+DATANODE0/storage_dn0/
+Datanode1/storage_dn1/
+
+# ===== Reconstructed Downloads =====
+Client/reconstructed_*
+Client/*.pdf
+Client/*.zip
+Client/*.png
+Client/*.jpg
+Client/*.mp4
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Environment =====
+.env
+venv/
+env/
+.agents/
