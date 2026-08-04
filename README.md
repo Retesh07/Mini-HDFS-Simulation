@@ -12,6 +12,10 @@
   <em>Built from scratch using raw TCP/UDP sockets, multithreading, and a real-time Flask dashboard — no external distributed frameworks used.</em>
 </p>
 
+<p align="center">
+  <img src="assets/dashboard.png" alt="Mini HDFS Dashboard" width="800" />
+</p>
+
 ---
 
 ## 📌 What Is This Project?
@@ -307,6 +311,10 @@ graph LR
 
 ## 📊 Dashboard Preview
 
+<p align="center">
+  <img src="assets/dashboard.png" alt="Mini HDFS Dashboard" width="800" />
+</p>
+
 The web dashboard provides a **real-time control center** for the distributed file system:
 
 | Section | What It Shows |
@@ -317,6 +325,20 @@ The web dashboard provides a **real-time control center** for the distributed fi
 | **Datanode Health** | Each node with pulsing green (online) or red (offline) indicators |
 | **Stored Files** | Lists healthy files with one-click download buttons |
 | **System Logs** | Terminal-style live log feed, auto-scrolling, refreshes every 3 seconds |
+
+---
+
+## ⚠️ Current Limitations
+
+| Limitation | Detail |
+|-----------|--------|
+| **Single Namenode** | No standby or secondary Namenode — single point of failure for metadata |
+| **2 Datanodes only** | Hardcoded to `dn0` and `dn1`; adding more requires config and code changes |
+| **No file deletion** | Files can be uploaded and downloaded but not deleted through the dashboard |
+| **No authentication** | No user auth or access control — anyone on the network can access the dashboard |
+| **Localhost only** | All nodes run on `127.0.0.1` — not designed for multi-machine deployment |
+| **No chunk-level encryption** | Data is stored and transferred in plaintext |
+| **Replication is metadata-only** | The healer updates replica metadata but does not yet initiate actual data transfer between Datanodes |
 
 ---
 
