@@ -12,10 +12,6 @@
   <em>Built from scratch using raw TCP/UDP sockets, multithreading, and a real-time Flask dashboard — no external distributed frameworks used.</em>
 </p>
 
-<p align="center">
-  <img src="assets/dashboard.png" alt="Mini HDFS Dashboard" width="800" />
-</p>
-
 ---
 
 ## 📌 What Is This Project?
@@ -310,10 +306,6 @@ graph LR
 ---
 
 ## 📊 Dashboard Preview
-
-<p align="center">
-  <img src="assets/dashboard.png" alt="Mini HDFS Dashboard" width="800" />
-</p>
 
 The web dashboard provides a **real-time control center** for the distributed file system:
 
