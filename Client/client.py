@@ -6,6 +6,7 @@ import struct
 import logging
 import threading
 import time
+import uuid
 from flask import Flask, render_template_string, request, jsonify, send_file
 from threading import Thread
 
@@ -77,23 +78,31 @@ def split_file(filename):
             checksums.append(hashlib.md5(chunk).hexdigest())
     return chunks, checksums
 
-def send_chunk(target_host, target_port, chunk_name, data, chunk_index, total_chunks):
+def send_chunk(target_host, target_port, chunk_name, data, chunk_index, total_chunks, replicas=None):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        log.info(f"Uploading chunk {chunk_index+1}/{total_chunks} ({chunk_name}) to {target_host}:{target_port}")
+        log.info(f"Uploading chunk {chunk_index+1}/{total_chunks} ({chunk_name}) to {target_host}:{target_port} (Pipeline: {replicas})")
         s.connect((target_host, target_port))
         s.sendall(b"STORE\n")
-        header = {"chunk_name": chunk_name, "size": len(data)}
+        header = {"chunk_name": chunk_name, "size": len(data), "replicas": replicas or []}
         payload = json.dumps(header).encode("utf-8")
         s.sendall(struct.pack(">I", len(payload)) + payload)
         ack = s.recv(32)
         if ack != b"READY":
             log.error(f"Datanode didn't acknowledge READY for {chunk_name}")
-            return
+            return False
         s.sendall(data)
-        log.info(f"✅ Sent {chunk_name} successfully")
+        
+        final_ack = s.recv(32)
+        if final_ack == b"OK":
+            log.info(f"✅ Sent {chunk_name} successfully")
+            return True
+        else:
+            log.error(f"Pipeline failed for {chunk_name}: {final_ack}")
+            return False
     except Exception as e:
         log.error(f"Error sending chunk {chunk_name}: {e}")
+        return False
     finally:
         s.close()
 
@@ -105,7 +114,8 @@ def upload_file(filename):
     num_chunks = len(chunks)
     log.info(f"Split into {num_chunks} chunks")
 
-    resp = send_to_namenode({"action": "upload_request", "filename": os.path.basename(filename), "num_chunks": num_chunks})
+    file_id = str(uuid.uuid4())
+    resp = send_to_namenode({"action": "upload_request", "filename": os.path.basename(filename), "file_id": file_id, "num_chunks": num_chunks})
     if not resp or resp.get("status") != "ok":
         log.error("Upload request failed.")
         return
@@ -113,18 +123,55 @@ def upload_file(filename):
     plan = resp["plan"]
     for i, chunk_info in enumerate(plan):
         data = chunks[i]
-        for host, port in chunk_info["datanodes"]:
-            send_chunk(host, port, chunk_info["chunk_name"], data, i, num_chunks)
+        replicas = chunk_info["datanodes"]
+        if not replicas:
+            continue
+            
+        current_host, current_port = replicas[0]
+        remaining_replicas = replicas[1:]
+        
+        success = send_chunk(current_host, current_port, chunk_info["chunk_name"], data, i, num_chunks, replicas=remaining_replicas)
+        
+        # Retry loop if upload fails
+        max_retries = 3
+        attempts = 0
+        while not success and attempts < max_retries:
+            attempts += 1
+            log.warning(f"Chunk pipeline upload failed at {current_host}:{current_port}. Requesting replacement datanode...")
+            req = {
+                "action": "chunk_upload_failed",
+                "file_id": file_id,
+                "chunk_id": i,
+                "failed_datanode": [current_host, current_port]
+            }
+            fallback_resp = send_to_namenode(req)
+            
+            if fallback_resp and fallback_resp.get("status") == "ok":
+                new_dn = fallback_resp["replacement_datanode"]
+                
+                # Update replicas list
+                replicas = [r for r in replicas if not (r[0] == current_host and int(r[1]) == int(current_port))]
+                replicas.append((new_dn[0], int(new_dn[1])))
+                
+                current_host, current_port = replicas[0]
+                remaining_replicas = replicas[1:]
+                
+                log.info(f"Retrying pipeline upload of {chunk_info['chunk_name']} starting at datanode {current_host}:{current_port}")
+                success = send_chunk(current_host, current_port, chunk_info["chunk_name"], data, i, num_chunks, replicas=remaining_replicas)
+            else:
+                error_msg = fallback_resp.get("message", "Unknown error") if fallback_resp else "Namenode connection failed"
+                log.error(f"Failed to get replacement datanode: {error_msg}")
+                break
 
-    commit = send_to_namenode({"action": "commit_upload", "filename": os.path.basename(filename)})
+    commit = send_to_namenode({"action": "commit_upload", "file_id": file_id})
     if commit and commit.get("status") == "ok":
         log.info("✅ Upload complete and committed.")
     else:
         log.warning("Upload complete but commit not confirmed.")
 
 # --- Download helpers ---
-def download_file(filename, output_path):
-    meta = send_to_namenode({"action": "download_request", "filename": filename})
+def download_file(file_id, output_path):
+    meta = send_to_namenode({"action": "download_request", "file_id": file_id})
     if not meta:
         error_msg = "Could not connect to Namenode. Is it running?"
         log.error(f"Download failed: {error_msg}")
@@ -523,8 +570,8 @@ HTML_PAGE = """
       </div>
     </div>
 
-    <!-- Upload / Download Row -->
-    <div class="grid-2col">
+    <!-- Upload Row -->
+    <div style="margin-bottom: 24px;">
 
       <!-- Upload -->
       <div class="card">
@@ -542,21 +589,6 @@ HTML_PAGE = """
             <button type="button" class="btn btn-upload" id="uploadBtn" onclick="uploadFile()">Upload to HDFS</button>
           </form>
           <div class="status-msg" id="uploadStatus"></div>
-        </div>
-      </div>
-
-      <!-- Download -->
-      <div class="card">
-        <div class="card-header">
-          <div class="card-icon download-icon">📥</div>
-          <h2>Download File</h2>
-        </div>
-        <div class="card-body">
-          <form id="downloadForm">
-            <input type="text" name="filename" id="downloadInput" placeholder="Enter exact filename (e.g. report.pdf)">
-            <button type="button" class="btn btn-download" onclick="downloadFile()">Download from HDFS</button>
-          </form>
-          <div class="status-msg" id="downloadStatus"></div>
         </div>
       </div>
     </div>
@@ -633,21 +665,9 @@ HTML_PAGE = """
       btn.disabled = false;
     }
 
-    // Download
-    function downloadFile() {
-      const filename = document.getElementById('downloadInput').value.trim();
-      const status = document.getElementById('downloadStatus');
-      if (!filename) { status.textContent = 'Please enter a filename.'; status.className = 'status-msg error'; return; }
-      status.textContent = 'Downloading...';
-      status.className = 'status-msg pending';
-      window.location.href = '/download?filename=' + encodeURIComponent(filename);
-      setTimeout(() => { status.textContent = ''; }, 3000);
-    }
-
     // Quick download from file list
-    function quickDownload(fname) {
-      document.getElementById('downloadInput').value = fname;
-      downloadFile();
+    function quickDownload(file_id, fname) {
+      window.location.href = '/download?file_id=' + encodeURIComponent(file_id) + '&filename=' + encodeURIComponent(fname);
     }
 
     // Refresh dashboard
@@ -688,10 +708,11 @@ HTML_PAGE = """
           const integrity = data.integrity || {};
           let html = '';
           let count = 0;
-          for (const [fname, chunks] of Object.entries(data.files)) {
-            if (integrity[fname] === false) continue;
+          for (const [file_id, fileData] of Object.entries(data.files)) {
+            if (integrity[file_id] === false) continue;
             count++;
-            const numChunks = chunks.length;
+            const fname = fileData.original_filename;
+            const numChunks = fileData.chunks.length;
             html += `
               <div class="file-item">
                 <div class="file-info">
@@ -701,7 +722,7 @@ HTML_PAGE = """
                     <div class="file-chunks">${numChunks} chunk${numChunks !== 1 ? 's' : ''}</div>
                   </div>
                 </div>
-                <button class="file-download-btn" onclick="quickDownload('${fname.replace(/'/g, "\\'")}')">Download</button>
+                <button class="file-download-btn" onclick="quickDownload('${file_id}', '${fname.replace(/'/g, "\\'")}')">Download</button>
               </div>`;
           }
           document.getElementById('filesList').innerHTML = html || '<div class="empty-state">No files uploaded yet</div>';
@@ -737,18 +758,16 @@ def api_upload():
     Thread(target=upload_file, args=(path,), daemon=True).start()
     return jsonify({"message": f"Uploading {file.filename}..."})
 
-@app.route("/download", methods=["GET", "POST"])
+@app.route("/download", methods=["GET"])
 def api_download():
-    if request.method == "POST":
-        filename = request.form.get("filename")
-    else:
-        filename = request.args.get("filename")
+    file_id = request.args.get("file_id")
+    filename = request.args.get("filename")
     
-    if not filename:
-        return "Filename is required", 400
+    if not file_id or not filename:
+        return "File ID and Filename are required", 400
         
     output_path = os.path.join(".", f"reconstructed_{filename}")
-    error = download_file(filename, output_path)
+    error = download_file(file_id, output_path)
     
     if error:
         return f"❌ {error}", 503

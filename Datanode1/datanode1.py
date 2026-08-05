@@ -56,13 +56,51 @@ def datanode_1(node_id, host, port, storage_dir, namenode_host, namenode_heartbe
 
     # --------------------------------
     # (1), (3), (4): Chunk storage and retrieval
-    # --------------------------------
+    # (2b) Block Report logic
+    def trigger_block_report():
+        try:
+            blocks = []
+            if os.path.exists(storage_dir):
+                for fname in os.listdir(storage_dir):
+                    if ".chunk" in fname:
+                        parts = fname.rsplit(".chunk", 1)
+                        if len(parts) == 2:
+                            filename, chunk_id_str = parts
+                            try:
+                                blocks.append({
+                                    "filename": filename,
+                                    "chunk_id": int(chunk_id_str)
+                                })
+                            except ValueError:
+                                pass
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((namenode_host, config["namenode"]["client_port"]))
+            req = {
+                "action": "block_report",
+                "dn_id": node_id,
+                "blocks": blocks
+            }
+            data = json.dumps(req).encode("utf-8")
+            header = struct.pack(">I", len(data))
+            s.sendall(header + data)
+            
+            # Recv response
+            hdr = s.recv(4)
+            if hdr:
+                length = struct.unpack(">I", hdr)[0]
+                s.recv(length)
+            s.close()
+            log.debug(f"[BLOCK_REPORT] Sent {len(blocks)} blocks from {node_id}")
+        except Exception as e:
+            log.error(f"[BLOCK_REPORT_FAIL] {e}")
+
+    # (1,3,4,5) Store & Retrieve logic
     def listen_for_chunks():
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((host, port))
         s.listen()
-        log.info(f"[LISTEN] Datanode1 ready on {host}:{port}")
+        log.info(f"[LISTEN] Datanode1 listening on {host}:{port}")
 
         while True:
             conn, addr = s.accept()
@@ -94,31 +132,64 @@ def datanode_1(node_id, host, port, storage_dir, namenode_host, namenode_heartbe
                 header = json.loads(header_raw.decode())
 
                 if cmd in ("REPLICATE", "STORE"):
+                    log.info(f"[STORE_REQUEST] Storing chunk {header['chunk_name']} ({header['size']} bytes)")
                     chunk_name = header["chunk_name"]
                     size = header["size"]
-                    checksum_ref = header.get("checksum")
-                    conn.sendall(b"READY")  # handshake
+                    replicas = header.get("replicas", [])
+                    conn.sendall(b"READY")
 
-                    # Receive data
                     data = b""
                     while len(data) < size:
-                        block = conn.recv(min(4096, size - len(data)))
-                        if not block:
+                        part = conn.recv(size - len(data))
+                        if not part:
+                            log.warning(f"[STORE_DATA_ERROR] Connection closed during chunk transfer for {chunk_name}")
                             break
-                        data += block
+                        data += part
+                    log.debug(f"[STORE_DATA] Received {len(data)} bytes for chunk {chunk_name}")
 
-                    # Verify checksum
-                    local_sum = checksum(data)
-                    if checksum_ref and local_sum != checksum_ref:
-                        log.warning(f"[CHECK_FAIL] {chunk_name} corrupted during transfer! REF={checksum_ref} LOCAL={local_sum}")
-                        conn.sendall(b"ERROR:CHECKSUM_FAIL")
-                        continue
-
-                    # Write chunk to storage
-                    path = os.path.join(storage_dir, chunk_name)
-                    with open(path, "wb") as f:
+                    # Data integrity check
+                    digest = checksum(data)
+                    log.info(f"[STORE_CHECKSUM] {chunk_name} MD5={digest}")
+                    chunk_path = os.path.join(storage_dir, chunk_name)
+                    with open(chunk_path, "wb") as f:
                         f.write(data)
-                    log.info(f"[STORE_OK] Stored {chunk_name} ({len(data)} bytes) MD5={local_sum}")
+                    log.info(f"[STORE_OK] Chunk stored at {chunk_path}")
+                    trigger_block_report()
+
+                    # Pipeline forwarding
+                    if replicas:
+                        next_host, next_port = replicas[0]
+                        remaining_replicas = replicas[1:]
+                        log.info(f"[PIPELINE] Forwarding {chunk_name} to {next_host}:{next_port}")
+                        try:
+                            ts = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            ts.connect((next_host, next_port))
+                            ts.sendall(b"STORE\n")
+                            theader = {"chunk_name": chunk_name, "size": len(data), "replicas": remaining_replicas}
+                            tpayload = json.dumps(theader).encode("utf-8")
+                            ts.sendall(struct.pack(">I", len(tpayload)) + tpayload)
+                            
+                            ack = ts.recv(32)
+                            if ack == b"READY":
+                                ts.sendall(data)
+                                final_ack = ts.recv(32)
+                                if final_ack == b"OK":
+                                    log.info(f"[PIPELINE_SUCCESS] {chunk_name} successfully pipelined")
+                                    conn.sendall(b"OK")
+                                else:
+                                    log.error(f"[PIPELINE_FAIL] Downstream failed: {final_ack}")
+                                    conn.sendall(b"ERROR:DOWNSTREAM_FAILED")
+                            else:
+                                log.error(f"[PIPELINE_FAIL] Downstream did not ack READY")
+                                conn.sendall(b"ERROR:DOWNSTREAM_NOT_READY")
+                        except Exception as e:
+                            log.error(f"[PIPELINE_FAIL] Exception: {e}")
+                            conn.sendall(b"ERROR:EXCEPTION")
+                        finally:
+                            if 'ts' in locals():
+                                ts.close()
+                    else:
+                        conn.sendall(b"OK")
 
                 elif cmd == "GET":
                     chunk_name = header["chunk_name"]
@@ -140,8 +211,50 @@ def datanode_1(node_id, host, port, storage_dir, namenode_host, namenode_heartbe
                     conn.sendall(data)
                     log.info(f"[GET_OK] Sent {chunk_name} ({len(data)} bytes) MD5={stored_sum}")
 
+                elif cmd == "FORWARD":
+                    chunk_name = header["chunk_name"]
+                    target_host = header["target_host"]
+                    target_port = header["target_port"]
+                    path = os.path.join(storage_dir, chunk_name)
+                    log.info(f"[FORWARD_REQUEST] Copying {chunk_name} to {target_host}:{target_port}")
+                    if not os.path.isfile(path):
+                        log.error(f"[FORWARD_FAIL] Missing {chunk_name}")
+                        conn.sendall(b"ERROR:NOT_FOUND")
+                        continue
+                        
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read()
+                        
+                        ts = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        ts.connect((target_host, target_port))
+                        ts.sendall(b"REPLICATE\n")
+                        theader = {"chunk_name": chunk_name, "size": len(data)}
+                        tpayload = json.dumps(theader).encode("utf-8")
+                        ts.sendall(struct.pack(">I", len(tpayload)) + tpayload)
+                        
+                        ack = ts.recv(32)
+                        if ack == b"READY":
+                            ts.sendall(data)
+                            final_ack = ts.recv(32)
+                            if final_ack == b"OK":
+                                log.info(f"[FORWARD_SUCCESS] Sent {chunk_name} to {target_host}:{target_port}")
+                                conn.sendall(b"OK")
+                            else:
+                                log.error(f"[FORWARD_FAIL] Target returned {final_ack}")
+                                conn.sendall(b"ERROR:TARGET_FAIL")
+                        else:
+                            log.error(f"[FORWARD_FAIL] Target did not ack READY")
+                            conn.sendall(b"ERROR:TARGET_NOT_READY")
+                    except Exception as e:
+                        log.error(f"[FORWARD_FAIL] Exception: {e}")
+                        conn.sendall(b"ERROR:EXCEPTION")
+                    finally:
+                        if 'ts' in locals():
+                            ts.close()
+
                 else:
-                    log.error(f"[CMD_ERROR] Unknown command '{cmd}'")
+                    log.error(f"[CMD_ERROR] Unknown command: {cmd}")
 
             except Exception as e:
                 log.exception(f"[ERROR] {e}")
@@ -152,41 +265,7 @@ def datanode_1(node_id, host, port, storage_dir, namenode_host, namenode_heartbe
     def send_block_report():
         while True:
             time.sleep(10)
-            try:
-                blocks = []
-                if os.path.exists(storage_dir):
-                    for fname in os.listdir(storage_dir):
-                        if ".chunk" in fname:
-                            parts = fname.rsplit(".chunk", 1)
-                            if len(parts) == 2:
-                                filename, chunk_id_str = parts
-                                try:
-                                    blocks.append({
-                                        "filename": filename,
-                                        "chunk_id": int(chunk_id_str)
-                                    })
-                                except ValueError:
-                                    pass
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect((namenode_host, config["namenode"]["client_port"]))
-                req = {
-                    "action": "block_report",
-                    "dn_id": node_id,
-                    "blocks": blocks
-                }
-                data = json.dumps(req).encode("utf-8")
-                header = struct.pack(">I", len(data))
-                s.sendall(header + data)
-                
-                # Recv response
-                hdr = s.recv(4)
-                if hdr:
-                    length = struct.unpack(">I", hdr)[0]
-                    s.recv(length)
-                s.close()
-                log.debug(f"[BLOCK_REPORT] Sent {len(blocks)} blocks from {node_id}")
-            except Exception as e:
-                log.error(f"[BLOCK_REPORT_FAIL] {e}")
+            trigger_block_report()
 
     threading.Thread(target=send_heartbeat, daemon=True, name="dn1-heartbeat").start()
     threading.Thread(target=send_block_report, daemon=True, name="dn1-blockreport").start()

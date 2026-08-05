@@ -12,11 +12,22 @@
   <em>Built from scratch using raw TCP/UDP sockets, multithreading, and a real-time Flask dashboard — no external distributed frameworks used.</em>
 </p>
 
+## Highlights
+
+- 🏗️ Built a distributed file system inspired by Apache HDFS
+- 📦 Chunk-based distributed storage
+- 🔁 Configurable replication with automatic recovery
+- 💓 UDP heartbeat monitoring & TCP block reports
+- ⚖️ Round-robin load balancing
+- 🔄 DataNode-to-DataNode replication
+- 🧵 Multithreaded architecture
+- 🌐 Real-time Flask dashboard
+
 ---
 
 ## 📌 What Is This Project?
 
-**Mini HDFS** is a fully functional simulation of the **Hadoop Distributed File System (HDFS)** — the backbone of big data storage used by companies like Facebook, Yahoo, and LinkedIn. This project demonstrates core distributed systems concepts by implementing them from the ground up in Python.
+**Mini HDFS** is an educational distributed file system inspired by Apache HDFS — the backbone of big data storage used by companies like Facebook, Yahoo, and LinkedIn. This project demonstrates core distributed systems concepts by implementing them from the ground up in Python.
 
 ### 🎯 The Problem It Solves
 In real-world systems, storing large files on a single machine is risky (hardware failure = data loss) and slow (single disk I/O bottleneck). HDFS solves this by:
@@ -24,7 +35,7 @@ In real-world systems, storing large files on a single machine is risky (hardwar
 - **Distributing** chunks across multiple storage nodes
 - **Replicating** each chunk for fault tolerance
 
-This project implements all three of these core principles.
+This project implements the core architectural ideas behind Apache HDFS, including chunking, metadata management, replication, heartbeat monitoring, and failure recovery.
 
 ---
 
@@ -33,71 +44,68 @@ This project implements all three of these core principles.
 ```mermaid
 graph TD
     Browser["🌐 Browser<br>localhost:8080"] --> Client["📦 Client<br>(client.py, port 8080)"]
-    Client -->|TCP port 5000| Namenode["🧠 Namenode<br>(namenode.py)"]
+    Client -->|TCP metadata| Namenode["🧠 Namenode<br>(namenode.py)"]
     Namenode -->|Upload Plan| Client
-    Client -->|STORE chunks| DN0["💾 Datanode 0<br>(datanode0.py, port 6001)"]
-    Client -->|STORE chunks| DN1["💾 Datanode 1<br>(datanode1.py, port 6002)"]
-    DN0 -->|UDP Heartbeat<br>port 5001| Namenode
-    DN1 -->|UDP Heartbeat<br>port 5001| Namenode
-    DN0 -->|TCP Block Report<br>port 5000| Namenode
-    DN1 -->|TCP Block Report<br>port 5000| Namenode
+    Client -->|Pipeline Upload| DN0["💾 Datanode 0<br>(port 6001)"]
+    DN0 -->|Pipeline Replicate| DN1["💾 Datanode 1<br>(port 6002)"]
+    Client -.->|Or other DNs| DN2["💾 Datanode 2<br>(port 6003)"]
+    Client -.->|Or other DNs| DN3["💾 Datanode 3<br>(port 6004)"]
+    
+    DN0 & DN1 & DN2 & DN3 -->|UDP Heartbeat| Namenode
+    DN0 & DN1 & DN2 & DN3 -->|TCP Block Report| Namenode
 ```
 
-The system consists of **4 independently running processes** communicating over the network — exactly like a real distributed system:
+The system consists of **6 independently running processes** communicating over the network:
 
 | Component | Role | Analogy |
 |-----------|------|---------|
 | **Namenode** | Central metadata controller | The "brain" — knows where every chunk lives |
-| **Datanode 0** | Storage worker node | A hard drive in a data center rack |
-| **Datanode 1** | Storage worker node (replica) | A second hard drive on a different rack |
-| **Client** | User-facing web app + file handler | The interface you interact with |
+| **Datanode [0-3]** | 4 Storage worker nodes | Hard drives distributed across multiple racks |
+| **Client** | User-facing web app | The interface you interact with |
 
 ---
 
 ## ✨ Key Features
 
-### 🔪 File Chunking & Reconstruction
-- Files are split into **2 MB chunks** before storage
-- During download, chunks are retrieved in order and **seamlessly reassembled** into the original file
-- Supports **any file type** — PDFs, images, videos, archives, etc.
+### 🔪 File Chunking & UUID Tracking
+- Files are split into **2 MB chunks** before storage.
+- Files are tracked internally via **UUIDs**, completely eliminating filename conflict issues. Two different users can safely upload files named `report.pdf`.
+- During download, chunks are retrieved in order and **seamlessly reassembled**.
 
-### 🔁 Data Replication (Fault Tolerance)
-- Every chunk is stored on **2 different Datanodes** (configurable replication factor)
-- If one Datanode goes down, data is still accessible from the replica
-- Chunk placement uses an **alternating primary/secondary strategy** for balanced distribution
+### 🔁 Pipeline Replication (HDFS Style)
+- Replicating data directly from the client is a bottleneck. We implemented **Pipeline Replication**.
+- The Client uploads exactly **1 copy** of a chunk to the Primary Datanode. 
+- That Datanode automatically pipes the chunk to the next Datanode, drastically reducing client-side network load and matching the exact behavior of Apache HDFS.
+- A synchronous `OK` acknowledgment is enforced end-to-end to guarantee data integrity before the pipeline completes.
 
-### 💓 Heartbeat Monitoring
-- Datanodes send **UDP heartbeat packets** every 3 seconds
-- The Namenode tracks heartbeats and marks nodes as **[DOWN]** after a 10-second timeout
-- Dashboard shows **real-time node health** with pulsing status indicators
+### 🧠 Smart Load Balancing
+- Chunk placement does not blindly dump data onto the same nodes.
+- Uses a round-robin placement algorithm to distribute chunks across available DataNodes (e.g., `Chunk0 -> DN0/DN1`, `Chunk1 -> DN2/DN3`, `Chunk2 -> DN1/DN2`).
 
-### 🩹 Automatic Self-Healing
-- A background **replication healer** thread runs every 10 seconds
-- Detects **under-replicated chunks** (fewer copies than the replication factor)
-- Automatically schedules **re-replication** to healthy nodes
-- Cleans up stale metadata for files with no live replicas
+### 💓 Heartbeat Monitoring & Block Reports
+- Datanodes send **UDP heartbeat packets** every 3 seconds.
+- The Namenode tracks heartbeats and marks nodes as **[DOWN]** after a 10-second timeout.
+- Datanodes send **TCP Block Reports** automatically to keep the Namenode's memory perfectly synchronized with actual disk state.
+
+### 🩹 True Physical Self-Healing
+- A background **replication healer** thread monitors the system.
+- If a Datanode dies, the replication factor drops. The Namenode detects this and **orchestrates recovery**.
+- The Namenode opens a TCP connection to a surviving Datanode and issues a `FORWARD` command.
+- The surviving Datanode opens a direct socket to a healthy target node and copies the chunk over the network. The Namenode *never* touches the file data itself.
 
 ### 📊 Real-Time Web Dashboard
-- Beautiful **dark-themed dashboard** built with HTML/CSS/JS
-- Upload files via **drag-and-drop** or file picker
-- One-click file download with automatic reconstruction
-- Live **Datanode health monitoring** with online/offline indicators
-- **System logs panel** with terminal-style auto-scrolling feed
-- Auto-refreshes every 3 seconds
-
-### 🔐 Data Integrity
-- **MD5 checksums** computed for every chunk during upload and download
-- Datanodes verify checksum integrity before accepting or serving data
-- Corrupted transfers are **rejected** and logged
+- Beautiful **dark-themed dashboard** built with HTML/CSS/JS.
+- Upload files via **drag-and-drop**.
+- One-click file download using internal UUIDs.
+- Live **Datanode health monitoring** with online/offline pulsing indicators.
+- **System logs panel** with terminal-style auto-scrolling feed.
 
 ---
 
 ## 🛠️ Technical Deep Dive
 
 ### Custom Network Protocol
-
 All inter-process communication uses a **custom framed JSON protocol** over TCP:
-
 ```
 ┌──────────────────────────────────┐
 │ 4 bytes (big-endian uint32)      │  ← Length of JSON payload
@@ -106,103 +114,49 @@ All inter-process communication uses a **custom framed JSON protocol** over TCP:
 └──────────────────────────────────┘
 ```
 
-Heartbeats are the exception — they use **UDP** for lightweight, fire-and-forget health checks.
-
-### Chunk Storage Protocol (Datanode ↔ Client)
-
-```
-Client → Datanode:  STORE\n → [4-byte header length] → [JSON header] → Datanode replies READY → [raw chunk bytes]
-Client → Datanode:  GET\n   → [4-byte header length] → [JSON header] → Datanode sends back [raw chunk bytes]
-```
-
-### Data Flow: Upload
+### Data Flow: Pipeline Upload
 
 ```mermaid
 sequenceDiagram
-    participant B as Browser
     participant C as Client
     participant N as Namenode
-    participant D0 as Datanode 0
-    participant D1 as Datanode 1
+    participant D0 as Primary DN
+    participant D1 as Replica DN
 
-    B->>C: POST /upload (file)
-    C->>C: Split file into 2MB chunks
-    C->>N: {"action": "upload_request", "filename": "...", "num_chunks": N}
-    N->>N: Generate chunk placement plan
-    N->>C: {"status": "ok", "plan": [...]}
-    loop For each chunk
-        C->>D0: STORE → header → data
-        D0->>D0: Save to storage_dn0/
-        C->>D1: STORE → header → data
-        D1->>D1: Save to storage_dn1/
-    end
-    C->>N: {"action": "commit_upload", "filename": "..."}
-    N->>C: {"status": "ok"}
+    C->>N: Request Upload
+    N->>C: Plan: [D0, D1]
+    C->>D0: STORE (header includes replicas=[D1])
+    D0->>C: READY
+    C->>D0: Stream Chunk Data
+    D0->>D0: Save to disk
+    D0->>D1: STORE (header includes replicas=[])
+    D1->>D0: READY
+    D0->>D1: Stream Chunk Data
+    D1->>D1: Save to disk
+    D1->>N: Immediate Block Report
+    D1->>D0: OK
+    D0->>N: Immediate Block Report
+    D0->>C: OK
 ```
 
-### Data Flow: Download
+### Data Flow: True Physical Healing
 
 ```mermaid
 sequenceDiagram
-    participant B as Browser
-    participant C as Client
     participant N as Namenode
-    participant D0 as Datanode 0
+    participant D0 as Surviving DN
+    participant D2 as Target DN
 
-    B->>C: GET /download?filename=report.pdf
-    C->>N: {"action": "download_request", "filename": "report.pdf"}
-    N->>C: {"status": "ok", "metadata": [chunk list with Datanode addresses]}
-    loop For each chunk
-        C->>D0: GET → header (chunk_name)
-        D0->>C: Raw chunk bytes
-    end
-    C->>C: Write all chunks to reconstructed file
-    C->>B: Stream file as HTTP attachment
-```
-
----
-
-## 🧵 Concurrency Model
-
-The system uses **Python threading** extensively to simulate real distributed processes:
-
-| Component | Threads | Purpose |
-|-----------|---------|---------|
-| **Namenode** | 4 background threads | Client listener, heartbeat listener, heartbeat monitor, replication healer |
-| **Datanode 0** | 3 threads | Chunk server (TCP), heartbeat sender (UDP), block report sender |
-| **Datanode 1** | 3 threads | Same as Datanode 0 |
-| **Client** | 2+ threads | Flask web server + background upload threads |
-
-All shared state is protected with **`threading.Lock`** to prevent race conditions.
-
----
-
-## 📁 Project Structure
-
-```
-mini_hdfs/
-├── config.json                    # Shared configuration (ports, replication factor, etc.)
-├── README.md                      # You are here
-├── project_description.md         # Detailed internal technical documentation
-│
-├── Namenode/
-│   ├── config.json                # Namenode's config copy
-│   ├── namenode.py                # Master node — metadata, heartbeats, healing (385 lines)
-│   └── metadata.json              # Persistent file/chunk registry (auto-generated)
-│
-├── DATANODE0/
-│   ├── config.json                # Datanode 0's config copy
-│   ├── datanode0.py               # Storage node 0 — chunk store/retrieve (191 lines)
-│   └── storage_dn0/               # Binary chunk files stored here
-│
-├── Datanode1/
-│   ├── config.json                # Datanode 1's config copy
-│   ├── datanode1.py               # Storage node 1 — with checksum verification (202 lines)
-│   └── storage_dn1/               # Binary chunk files stored here
-│
-└── Client/
-    ├── config.json                # Client's config copy
-    └── client.py                  # Flask dashboard + upload/download engine (788 lines)
+    N->>N: Healer detects under-replicated chunk
+    N->>D0: FORWARD chunk to D2
+    D0->>D2: REPLICATE
+    D2->>D0: READY
+    D0->>D2: Stream Chunk Data
+    D2->>D2: Save to disk
+    D2->>N: Immediate Block Report
+    D2->>D0: OK
+    D0->>N: OK (Success)
+    N->>N: Update metadata replica lists
 ```
 
 ---
@@ -214,52 +168,41 @@ mini_hdfs/
 - **Flask** (`pip install flask`)
 
 ### Running the System
-
-Open **4 separate terminals** and run each component (order matters):
+Open **6 separate terminals** and run each component:
 
 ```bash
-# Terminal 1 — Start the Namenode (must be first)
-cd Namenode
-python namenode.py
+# Terminal 1 — Start the Namenode
+cd Namenode && python namenode.py
 
-# Terminal 2 — Start Datanode 0
-cd DATANODE0
-python datanode0.py
+# Terminals 2 to 5 — Start the Datanodes
+cd DATANODE0 && python datanode0.py
+cd Datanode1 && python datanode1.py
+cd DATANODE2 && python datanode2.py
+cd DATANODE3 && python datanode3.py
 
-# Terminal 3 — Start Datanode 1
-cd Datanode1
-python datanode1.py
-
-# Terminal 4 — Start the Client Dashboard
-cd Client
-python client.py
+# Terminal 6 — Start the Client Dashboard
+cd Client && python client.py
 ```
 
-Then open your browser at **http://localhost:8080** 🎉
+Open your browser at **http://localhost:8080** 🎉
 
 ### Testing Fault Tolerance
-1. Upload a file through the dashboard
-2. **Kill Datanode 0** (Ctrl+C in Terminal 2)
-3. Watch the dashboard show Datanode 0 as ❌ **Offline**
-4. **Download the same file** — it works because the replica exists on Datanode 1
-5. Restart Datanode 0 — the healer will re-replicate any under-replicated chunks
+1. Upload a file.
+2. **Kill Datanode 0**. Watch the dashboard mark it ❌ **Offline**.
+3. **Download the file** — it succeeds seamlessly using surviving replicas.
+4. Watch the Namenode terminal. You will see it orchestrate a **Pipeline Recovery**, instructing another Datanode to physically transfer the missing data to a healthy node!
 
 ---
 
 ## ⚙️ Configuration
-
-All settings are centralized in `config.json`:
+All settings are in `config.json` (and synchronized to the component folders):
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `replication_factor` | `2` | Number of copies per chunk |
 | `chunk_size_mb` | `2` | Maximum chunk size in MB |
 | `heartbeat_interval_sec` | `3` | Datanode heartbeat frequency |
-| `heartbeat_timeout_sec` | `10` | Seconds before a silent Datanode is marked dead |
-| `namenode.client_port` | `5000` | TCP port for Namenode ↔ Client communication |
-| `namenode.heartbeat_port` | `5001` | UDP port for heartbeat signals |
-| `datanodes.dn0.port` | `6001` | TCP port for Datanode 0 |
-| `datanodes.dn1.port` | `6002` | TCP port for Datanode 1 |
+| `heartbeat_timeout_sec` | `10` | Timeout before node is marked dead |
 
 ---
 
@@ -267,96 +210,28 @@ All settings are centralized in `config.json`:
 
 | Concept | How It's Implemented |
 |---------|---------------------|
-| **Data Partitioning (Sharding)** | Files split into fixed-size 2 MB chunks distributed across nodes |
-| **Replication** | Each chunk stored on 2 Datanodes with alternating primary/secondary placement |
-| **Failure Detection** | UDP heartbeat mechanism with configurable timeout |
-| **Self-Healing** | Background replication healer detects and fixes under-replicated data |
-| **Metadata Management** | Centralized Namenode with persistent JSON-backed metadata store |
-| **Block Reports** | Datanodes periodically scan local storage and report inventory to Namenode |
-| **Client-Server Architecture** | Multi-tier: Browser → Flask Client → Namenode → Datanodes |
-| **Custom Wire Protocol** | Length-prefixed framed JSON over TCP, UDP for heartbeats |
-| **Consistency** | Thread-safe shared state with mutex locks |
-| **Data Integrity** | MD5 checksums verified on every chunk transfer |
-| **Graceful Degradation** | System continues serving files even when nodes fail |
-
----
-
-## 🛡️ How Fault Tolerance Works
-
-```mermaid
-graph LR
-    subgraph Normal["✅ Normal State"]
-        A["Chunk A"] --> DN0a["Datanode 0"]
-        A --> DN1a["Datanode 1"]
-    end
-
-    subgraph Failure["⚠️ Node Failure"]
-        B["Chunk A"] -.->|"❌ DOWN"| DN0b["Datanode 0"]
-        B -->|"✅ Still available"| DN1b["Datanode 1"]
-    end
-
-    subgraph Healed["🩹 After Healing"]
-        C["Chunk A"] -->|"Re-replicated"| DN0c["Datanode 0"]
-        C --> DN1c["Datanode 1"]
-    end
-
-    Normal --> Failure --> Healed
-```
-
----
-
-## 📊 Dashboard Preview
-
-The web dashboard provides a **real-time control center** for the distributed file system:
-
-| Section | What It Shows |
-|---------|--------------|
-| **Status Cards** | Live count of online Datanodes, total files, chunk size, replication factor |
-| **Upload Panel** | Drag-and-drop file upload with progress feedback |
-| **Download Panel** | Enter filename to download reconstructed file |
-| **Datanode Health** | Each node with pulsing green (online) or red (offline) indicators |
-| **Stored Files** | Lists healthy files with one-click download buttons |
-| **System Logs** | Terminal-style live log feed, auto-scrolling, refreshes every 3 seconds |
+| **Data Partitioning** | Files split into fixed 2MB chunks. |
+| **Metadata Management** | Centralized NameNode tracks chunk locations and replica information. |
+| **Pipeline Replication** | Chunks stream sequentially across the cluster to minimize client bottlenecks. |
+| **Smart Load Balancing** | Placement algorithm sprays chunks evenly across 4 independent Datanodes. |
+| **UUID Identification** | Complete decoupling of underlying physical storage IDs from user-facing names. |
+| **Self-Healing** | Background orchestrator orchestrates physical node-to-node transfers. |
+| **Block Reports** | Instant state reconciliation after successful writes. |
+| **Custom Wire Protocol** | TCP framed JSON streams and UDP heartbeats. |
+| **Consistency** | Thread-safe locks and synchronous end-to-end `OK` pipeline acknowledgments. |
 
 ---
 
 ## ⚠️ Current Limitations
 
-| Limitation | Detail |
-|-----------|--------|
-| **Single Namenode** | No standby or secondary Namenode — single point of failure for metadata |
-| **2 Datanodes only** | Hardcoded to `dn0` and `dn1`; adding more requires config and code changes |
-| **No file deletion** | Files can be uploaded and downloaded but not deleted through the dashboard |
-| **No authentication** | No user auth or access control — anyone on the network can access the dashboard |
-| **Localhost only** | All nodes run on `127.0.0.1` — not designed for multi-machine deployment |
-| **No chunk-level encryption** | Data is stored and transferred in plaintext |
-| **Replication is metadata-only** | The healer updates replica metadata but does not yet initiate actual data transfer between Datanodes |
+This project intentionally simplifies some production HDFS features:
 
----
-
-## 🔮 Future Enhancements
-
-- [ ] Add more Datanodes (dynamic scaling)
-- [ ] Implement rack-awareness for replica placement
-- [ ] Add file deletion support
-- [ ] Implement Namenode HA (High Availability) with a secondary Namenode
-- [ ] Add chunk-level encryption
-- [ ] Dockerize each component for true distributed deployment
-- [ ] Implement data balancer for storage equalization
-
----
-
-## 📚 Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| **Language** | Python 3 |
-| **Networking** | Raw TCP/UDP sockets (`socket` module) |
-| **Concurrency** | `threading` module with mutex locks |
-| **Web Framework** | Flask |
-| **Frontend** | HTML5, CSS3 (custom dark theme), Vanilla JavaScript |
-| **Data Format** | JSON (wire protocol + metadata persistence) |
-| **Integrity** | MD5 checksums (`hashlib`) |
+- Single NameNode (single point of failure)
+- No Secondary NameNode / High Availability
+- No Rack-Aware Replica Placement
+- No Authentication or Authorization
+- No Erasure Coding
+- Educational-scale cluster
 
 ---
 

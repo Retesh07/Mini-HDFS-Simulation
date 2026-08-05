@@ -61,7 +61,7 @@ def load_metadata():
 # =========================
 # Global State
 # =========================
-metadata: Dict[str, List[Dict]] = load_metadata()
+metadata: Dict[str, Dict] = load_metadata()
 chunk_locations: Dict[Tuple[str, int], Set[str]] = {}
 heartbeat_table: Dict[str, float] = {dn_id: 0.0 for dn_id in DATANODES.keys()}
 state_lock = threading.Lock()
@@ -108,16 +108,20 @@ def datanode_host_port(dn_id: str) -> Tuple[str, int]:
     return info["host"], int(info["port"])
 
 def plan_two_replicas(cid: int, live_ids: List[str]) -> List[Tuple[str, int]]:
-    if set(live_ids) == {"dn0", "dn1"}:
-        primary = "dn0" if cid % 2 == 0 else "dn1"
-        secondary = "dn1" if primary == "dn0" else "dn0"
-        return [datanode_host_port(primary), datanode_host_port(secondary)]
-    elif "dn0" in live_ids:
-        return [datanode_host_port("dn0")]
-    elif "dn1" in live_ids:
-        return [datanode_host_port("dn1")]
-    else:
+    if not live_ids:
         return []
+        
+    sorted_live = sorted(live_ids)
+    num_replicas = min(REPLICATION, len(sorted_live))
+    start_idx = cid % len(sorted_live)
+    
+    replicas = []
+    for i in range(num_replicas):
+        idx = (start_idx + i) % len(sorted_live)
+        dn_id = sorted_live[idx]
+        replicas.append(datanode_host_port(dn_id))
+        
+    return replicas
 
 # =========================
 # Client Handler
@@ -133,9 +137,10 @@ def handle_client(conn, addr):
         # ---- UPLOAD ----
         if action in ("upload", "upload_request"):
             filename = req["filename"]
+            file_id = req["file_id"]
             num_chunks = int(req["num_chunks"])
             chunk_sizes = req.get("chunk_sizes", [])
-            log.info(f"[UPLOAD INIT] {filename}, chunks={num_chunks}")
+            log.info(f"[UPLOAD INIT] {filename} (ID: {file_id}), chunks={num_chunks}")
 
             with state_lock:
                 live = live_datanodes_ids()
@@ -148,15 +153,18 @@ def handle_client(conn, addr):
                     endpoints = plan_two_replicas(cid, live)
                     plan.append({
                         "chunk_id": cid,
-                        "chunk_name": f"{filename}.chunk{cid}",
+                        "chunk_name": f"{file_id}.chunk{cid}",
                         "datanodes": endpoints
                     })
 
-                metadata[filename] = []
+                metadata[file_id] = {
+                    "original_filename": filename,
+                    "chunks": []
+                }
                 for cid in range(num_chunks):
-                    metadata[filename].append({
+                    metadata[file_id]["chunks"].append({
                         "chunk_id": cid,
-                        "chunk_name": f"{filename}.chunk{cid}",
+                        "chunk_name": f"{file_id}.chunk{cid}",
                         "replicas": plan[cid]["datanodes"],
                         "size": chunk_sizes[cid] if cid < len(chunk_sizes) else CHUNK_BYTES
                     })
@@ -166,27 +174,27 @@ def handle_client(conn, addr):
 
         # ---- COMMIT ----
         elif action == "commit_upload":
-            filename = req["filename"]
+            file_id = req["file_id"]
             with state_lock:
-                if filename in metadata:
+                if file_id in metadata:
                     save_metadata(metadata)
                     send_json(conn, {"status": "ok", "message": "commit recorded"})
-                    log.info(f"[COMMIT] {filename} recorded")
+                    log.info(f"[COMMIT] {file_id} recorded")
                 else:
                     send_json(conn, {"status": "error", "message": "unknown file"})
 
         # ---- DOWNLOAD ----
         elif action in ("download", "download_request"):
-            filename = req["filename"]
+            file_id = req["file_id"]
             with state_lock:
-                if filename in metadata:
+                if file_id in metadata:
                     live = set(live_datanodes_ids())
                     if not live:
                         send_json(conn, {"status": "error", "message": "All datanodes are offline. Start the datanodes and try again."})
                         return
                     result = []
                     has_unavailable_chunk = False
-                    for rec in metadata[filename]:
+                    for rec in metadata[file_id]["chunks"]:
                         live_repls = []
                         for host, port in rec["replicas"]:
                             for k, v in DATANODES.items():
@@ -202,11 +210,11 @@ def handle_client(conn, addr):
                             "size": rec["size"]
                         })
                     if has_unavailable_chunk:
-                        send_json(conn, {"status": "error", "message": f"File '{filename}' is unavailable — the datanodes holding its chunks are offline."})
+                        send_json(conn, {"status": "error", "message": f"File '{metadata[file_id]['original_filename']}' is unavailable — the datanodes holding its chunks are offline."})
                     else:
-                        send_json(conn, {"status": "ok", "metadata": result})
+                        send_json(conn, {"status": "ok", "metadata": result, "original_filename": metadata[file_id]["original_filename"]})
                 else:
-                    send_json(conn, {"status": "error", "message": f"File '{filename}' not found on the Namenode."})
+                    send_json(conn, {"status": "error", "message": f"File ID '{file_id}' not found on the Namenode."})
 
         # ---- LIST FILES ----
         elif action == "list_files":
@@ -229,6 +237,51 @@ def handle_client(conn, addr):
             send_json(conn, {"status": "ok"})
             log.info(f"[BLOCK REPORT] {dn_id}: {len(blocks)} blocks")
 
+        # ---- CHUNK UPLOAD FAILED ----
+        elif action == "chunk_upload_failed":
+            file_id = req["file_id"]
+            chunk_id = int(req["chunk_id"])
+            failed_host, failed_port = req["failed_datanode"]
+            
+            with state_lock:
+                if file_id not in metadata or chunk_id >= len(metadata[file_id]["chunks"]):
+                    send_json(conn, {"status": "error", "message": "Unknown file or chunk"})
+                    return
+                
+                chunk_rec = metadata[file_id]["chunks"][chunk_id]
+                replicas = chunk_rec["replicas"]
+                
+                # Remove the failed datanode from replicas
+                chunk_rec["replicas"] = [
+                    r for r in replicas
+                    if not (r[0] == failed_host and int(r[1]) == int(failed_port))
+                ]
+                
+                live = live_datanodes_ids()
+                if not live:
+                    send_json(conn, {"status": "error", "message": "No live datanodes available"})
+                    return
+                    
+                # Find candidates that are not already in replicas
+                existing_replicas = set((r[0], int(r[1])) for r in chunk_rec["replicas"])
+                candidates = []
+                for dn_id in live:
+                    host, port = datanode_host_port(dn_id)
+                    if (host, port) not in existing_replicas:
+                        candidates.append((host, port))
+                        
+                if not candidates:
+                    send_json(conn, {"status": "error", "message": "No replacement datanodes available"})
+                    return
+                    
+                # Pick the first available candidate
+                new_dn = candidates[0]
+                chunk_rec["replicas"].append(new_dn)
+                save_metadata(metadata)
+                
+                log.info(f"[RECOVERY] {file_id} chunk {chunk_id}: replaced {failed_host}:{failed_port} with {new_dn[0]}:{new_dn[1]}")
+                send_json(conn, {"status": "ok", "replacement_datanode": new_dn})
+
         # ---- SYSTEM STATUS ----
         elif action == "system_status":
             with state_lock:
@@ -245,20 +298,23 @@ def handle_client(conn, addr):
                 
                 # Build files info
                 files_info = {}
-                for fname, chunks in metadata.items():
-                    files_info[fname] = [
-                        {
-                            "chunk_name": ch["chunk_name"],
-                            "datanodes": ch["replicas"]
-                        } for ch in chunks
-                    ]
+                for file_id, data in metadata.items():
+                    files_info[file_id] = {
+                        "original_filename": data["original_filename"],
+                        "chunks": [
+                            {
+                                "chunk_name": ch["chunk_name"],
+                                "datanodes": ch["replicas"]
+                            } for ch in data["chunks"]
+                        ]
+                    }
                 
                 # Build integrity info
                 integrity_info = {}
-                for fname, chunks in metadata.items():
+                for file_id, data in metadata.items():
                     file_ok = True
-                    for ch in chunks:
-                        key = (fname, ch["chunk_id"])
+                    for ch in data["chunks"]:
+                        key = (file_id, ch["chunk_id"])
                         holders = chunk_locations.get(key, set())
                         has_alive_replica = False
                         for dn_id in holders:
@@ -268,7 +324,7 @@ def handle_client(conn, addr):
                         if not has_alive_replica:
                             file_ok = False
                             break
-                    integrity_info[fname] = file_ok
+                    integrity_info[file_id] = file_ok
                     
             send_json(conn, {
                 "status": "ok",
@@ -324,6 +380,33 @@ def heartbeat_monitor():
                 else:
                     log.info(f"[ALIVE] {dn_id}")
 
+def trigger_replication(source_host: str, source_port: int, dest_host: str, dest_port: int, chunk_name: str) -> bool:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(30.0)
+        s.connect((source_host, source_port))
+        
+        s.sendall(b"FORWARD\n")
+        req = {
+            "chunk_name": chunk_name,
+            "target_host": dest_host,
+            "target_port": dest_port
+        }
+        data = json.dumps(req).encode("utf-8")
+        s.sendall(struct.pack(">I", len(data)) + data)
+        
+        ack = s.recv(1024).decode("utf-8").strip()
+        s.close()
+        
+        if ack == "OK":
+            return True
+        else:
+            log.error(f"[REPLICATION_FAIL] Source returned: {ack}")
+            return False
+    except Exception as e:
+        log.error(f"[REPLICATION_FAIL] Exception during FORWARD to {source_host}:{source_port}: {e}")
+        return False
+
 def replication_healer():
     while True:
         time.sleep(10)
@@ -339,20 +422,30 @@ def replication_healer():
                 continue
 
             stale_files = []
-            for filename, chunks in metadata.items():
+            for file_id, data in metadata.items():
                 all_chunks_missing = True
-                for rec in chunks:
-                    key = (filename, rec["chunk_id"])
+                for rec in data["chunks"]:
+                    key = (file_id, rec["chunk_id"])
                     holders = chunk_locations.get(key, set())
                     live_holders = holders & live
                     if len(live_holders) > 0:
                         all_chunks_missing = False
                         # Only heal if at least 1 live holder exists (can replicate from it)
                         if len(live_holders) < REPLICATION:
+                            source_dn_id = list(live_holders)[0]
+                            source_host, source_port = datanode_host_port(source_dn_id)
+                            
                             candidates = [dn for dn in DATANODES.keys() if dn not in holders and dn in live]
-                            for dn_id in candidates[:REPLICATION - len(live_holders)]:
-                                rec["replicas"].append(datanode_host_port(dn_id))
-                                log.info(f"[HEAL] {filename} chunk {rec['chunk_id']} → added {dn_id}")
+                            for dest_dn_id in candidates[:REPLICATION - len(live_holders)]:
+                                dest_host, dest_port = datanode_host_port(dest_dn_id)
+                                log.info(f"[HEAL_START] Orchestrating replication of {rec['chunk_name']} from {source_dn_id} to {dest_dn_id}")
+                                
+                                success = trigger_replication(source_host, source_port, dest_host, dest_port, rec['chunk_name'])
+                                if success:
+                                    rec["replicas"].append((dest_host, dest_port))
+                                    log.info(f"[HEAL_SUCCESS] {rec['chunk_name']} successfully replicated to {dest_dn_id}")
+                                else:
+                                    log.warning(f"[HEAL_FAIL] Failed to replicate {rec['chunk_name']} to {dest_dn_id}")
                         # Deduplicate replicas list
                         seen = set()
                         unique_replicas = []
@@ -363,11 +456,11 @@ def replication_healer():
                                 unique_replicas.append(r)
                         rec["replicas"] = unique_replicas
                 if all_chunks_missing:
-                    stale_files.append(filename)
+                    stale_files.append(file_id)
             # Remove files with no chunks on any live Datanode
-            for fname in stale_files:
-                del metadata[fname]
-                log.info(f"[CLEANUP] Removed stale metadata for '{fname}' (confirmed: no chunks on any live Datanode)")
+            for fid in stale_files:
+                del metadata[fid]
+                log.info(f"[CLEANUP] Removed stale metadata for '{fid}' (confirmed: no chunks on any live Datanode)")
             save_metadata(metadata)
 
 # =========================
